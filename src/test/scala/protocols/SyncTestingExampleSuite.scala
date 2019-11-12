@@ -1,0 +1,3 @@
+package protocols
+
+class SyncTestingExampleSuite extends SyncTestingExampleSpec
