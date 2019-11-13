@@ -1,9 +1,11 @@
 package protocols
 
+import akka.actor.typed.Behavior.start
 import akka.actor.typed._
 import akka.actor.typed.scaladsl._
 import akka.stream.impl.fusing.Batch
 import akka.util.Timeout
+import protocols.SelectiveReceiveOrig.Interceptor
 
 import scala.concurrent.duration._
 
@@ -15,7 +17,6 @@ object Transactor {
 
     sealed trait Command[T] extends PrivateCommand[T]
     final case class Begin[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
-    final case class TimeoutTransactor[T](value: T, replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
 
     sealed trait Session[T] extends Product with Serializable
     final case class Extract[T, U](f: T => U, replyTo: ActorRef[U]) extends Session[T]
@@ -42,24 +43,13 @@ object Transactor {
     def parentBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] = {
 
             Behaviors.receive[Command[T]] {
-                case (ctx, TimeoutTransactor(originalValue, replyTo)) => {
-                    // replyTo ! originalValue
-                    Behaviors.stopped[Command[T]]
-                }
                 case (ctx, Begin(replyTo)) => {
                     println("Begin!!!")
-                    Behaviors.withTimers[Command[T]] { timers =>
-                        // instead of FSM state timeout
-                        timers.startSingleTimer(TimeoutTransactor(value, null), null, sessionTimeout)
-                      Behaviors.empty
-                    }
-                    val p = ctx.spawnAnonymous(committedBuilder(value, sessionTimeout))
-                    val sh = sessionHandler(value, p, Set())
+                    val sh = sessionHandler(value, null, Set(), sessionTimeout)
                     val actorRef = ctx.spawnAnonymous(sh)
-                    //                inSession(value, sessionTimeout, )
-                    //                val actorRef = ctx.spawnAnonymous(idle[T](value, sessionTimeout))
                     replyTo ! actorRef
                     ctx.watch(actorRef)
+                    val p = ctx.spawnAnonymous(committedBuilder(value, sessionTimeout))
                     Behaviors.same[Command[T]]
                 }
                 case (ctx, _) => {
@@ -82,19 +72,8 @@ object Transactor {
       */
     def apply[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] =
     {
-
-
-
-        println("apply " + value + " " + sessionTimeout)
-//        Behaviors.withTimers[T] { timers => {
-//            timers.startSingleTimer(Timeout, value, sessionTimeout)
-//        } }
         SelectiveReceive.apply(30, parentBuilder(value, sessionTimeout))
-//        childActor
     }
-
-
-    //
 
     /**
       * @return A behavior that defines how to react to any [[PrivateCommand]] when the transactor
@@ -114,9 +93,6 @@ object Transactor {
       *   - Messages other than [[Begin]] should not change the behavior.
       */
     private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] = {
-//        Behaviors.withTimers[PrivateCommand[T]](timers => {
-//            timers.startSingleTimer(value, RolledBack(inSession(value, sessionTimeout, null), sessionTimeout)
-//        })
         Behaviors.receive[PrivateCommand[T]] {
             case (ctx, Committed(session, value)) => {
                 Behaviors.same[PrivateCommand[T]]
@@ -143,9 +119,6 @@ object Transactor {
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
     {
         Behaviors.receive[PrivateCommand[T]] {
-            case (ctx, TimeoutTransactor(originalValue, replyTo)) => {
-                Behaviors.same[PrivateCommand[T]]
-            }
             case (ctx, Begin(replyTo)) => {
                 Behaviors.same[PrivateCommand[T]]
             }
@@ -166,7 +139,7 @@ object Transactor {
       * @param commit Parent actor reference, to send the [[Committed]] message to
       * @param done Set of already applied [[Modify]] messages
       */
-    private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long]): Behavior[Session[T]] =
+    private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long], sessionTimeout: FiniteDuration): Behavior[Session[T]] =
     {
         println("Entering  sessionHandler currentValue " + currentValue + " commit " + commit + " done " + done)
         Behaviors.receive[Session[T]] {
@@ -186,8 +159,8 @@ object Transactor {
                     val ret = f(currentValue)
                     println("Received Modify - apply function " + f + " returns " + ret)
                     replyTo.narrow.tell(reply)
-//                    ctx.self ! Stopped()
-                    sessionHandler(ret, commit, (done + id))
+                    Behaviors.stopped
+                    sessionHandler(ret, commit, (done + id), sessionTimeout)
                 } else {
                     println("Received Modify - done already contains " + id + " and returns currentValue " + currentValue)
                     replyTo.narrow.tell(reply)
@@ -196,8 +169,8 @@ object Transactor {
             }
             case (ctx, Commit(reply, replyTo)) => {
                 println("Received Commit " + reply + " " + replyTo)
-//                commit ! Committed(replyTo, currentValue)
-                Behaviors.same[Session[T]]
+//                replyTo.narrow.tell(reply)
+                Behaviors.same
             }
             case (ctx, Rollback()) => {
                 println("Received Rollback")
@@ -209,5 +182,42 @@ object Transactor {
             }
         }
     }
-        
+
+    private class Interceptor[T](bufferSize: Int) extends BehaviorInterceptor[T, T] {
+        import BehaviorInterceptor.{ReceiveTarget, SignalTarget}
+
+        var buffer = List[T]()
+        /**
+          * @param ctx Actor context
+          * @param msg Incoming message
+          * @param target Target (intercepted) behavior
+          */
+        def aroundReceive(ctx: TypedActorContext[T], msg: T, target: ReceiveTarget[T]): Behavior[T] = {
+            try {
+                println(msg)
+                val next = target(ctx, msg)
+                if (Behavior.isUnhandled(next)) {
+                    if (buffer.size == bufferSize) {
+                        throw new StashOverflowException("")
+                    } else {
+                        buffer = msg :: buffer
+                        next
+                    }
+                } else {
+                    //                    buffer.unstashAll(ctx.asScala, new ExtBehavior(initial, canonicalize(next, started, ctx)))
+                    buffer.head
+                    Behaviors.empty
+                }
+            } catch {
+                case ex: StashOverflowException => throw ex
+            }
+        }
+
+        // Forward signals to the target behavior
+        def aroundSignal(ctx: TypedActorContext[T], signal: Signal, target: SignalTarget[T]): Behavior[T] =
+            target(ctx, signal)
+
+    }
+
+
 }
