@@ -15,13 +15,60 @@ object Transactor {
 
     sealed trait Command[T] extends PrivateCommand[T]
     final case class Begin[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
+    final case class TimeoutTransactor[T](value: T, replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
 
     sealed trait Session[T] extends Product with Serializable
     final case class Extract[T, U](f: T => U, replyTo: ActorRef[U]) extends Session[T]
     final case class Modify[T, U](f: T => T, id: Long, reply: U, replyTo: ActorRef[U]) extends Session[T]
     final case class Commit[T, U](reply: U, replyTo: ActorRef[U]) extends Session[T]
     final case class Rollback[T]() extends Session[T]
+    final case class Stopped[T]() extends Session[T]
 
+    def committedBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Committed[T]] = {
+        Behaviors.receive[Committed[T]] {
+            case (ctx, Committed(session, value)) => {
+                println("commitedBuilder Committed!!!")
+//                session.narrow.tell(Commit(value, session))
+                Behaviors.same[Committed[T]]
+            }
+            case (ctx, _) => {
+                println("commitedBuilder Others!!!")
+                idle[T](value, sessionTimeout)
+                Behaviors.same[Committed[T]]
+            }
+        }
+    }
+
+    def parentBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] = {
+
+            Behaviors.receive[Command[T]] {
+                case (ctx, TimeoutTransactor(originalValue, replyTo)) => {
+                    // replyTo ! originalValue
+                    Behaviors.stopped[Command[T]]
+                }
+                case (ctx, Begin(replyTo)) => {
+                    println("Begin!!!")
+                    Behaviors.withTimers[Command[T]] { timers =>
+                        // instead of FSM state timeout
+                        timers.startSingleTimer(TimeoutTransactor(value, null), null, sessionTimeout)
+                      Behaviors.empty
+                    }
+                    val p = ctx.spawnAnonymous(committedBuilder(value, sessionTimeout))
+                    val sh = sessionHandler(value, p, Set())
+                    val actorRef = ctx.spawnAnonymous(sh)
+                    //                inSession(value, sessionTimeout, )
+                    //                val actorRef = ctx.spawnAnonymous(idle[T](value, sessionTimeout))
+                    replyTo ! actorRef
+                    ctx.watch(actorRef)
+                    Behaviors.same[Command[T]]
+                }
+                case (ctx, _) => {
+                    println("Others!!!")
+                    idle[T](value, sessionTimeout)
+                    Behaviors.same[Command[T]]
+                }
+            }
+    }
 
     /**
       * @return A behavior that accepts public [[Command]] messages. The behavior
@@ -35,28 +82,14 @@ object Transactor {
       */
     def apply[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] =
     {
+
+
+
         println("apply " + value + " " + sessionTimeout)
-        val childActor = Behaviors.receive[Command[T]] {
-            case (ctx, Begin(replyTo)) => {
-                println("Begin!!!")
-                val sh = sessionHandler(value, null, Set())
-                val actorRef = ctx.spawnAnonymous(sh)
-//                inSession(value, sessionTimeout, )
-//                val actorRef = ctx.spawnAnonymous(idle[T](value, sessionTimeout))
-                replyTo ! actorRef
-                ctx.watch(actorRef)
-                Behaviors.same[Command[T]]
-            }
-            case (ctx, _) => {
-                println("Others!!!")
-                idle[T](value, sessionTimeout)
-                Behaviors.same[Command[T]]
-            }
-        }
 //        Behaviors.withTimers[T] { timers => {
 //            timers.startSingleTimer(Timeout, value, sessionTimeout)
 //        } }
-        SelectiveReceive.apply(30, childActor)
+        SelectiveReceive.apply(30, parentBuilder(value, sessionTimeout))
 //        childActor
     }
 
@@ -110,6 +143,9 @@ object Transactor {
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
     {
         Behaviors.receive[PrivateCommand[T]] {
+            case (ctx, TimeoutTransactor(originalValue, replyTo)) => {
+                Behaviors.same[PrivateCommand[T]]
+            }
             case (ctx, Begin(replyTo)) => {
                 Behaviors.same[PrivateCommand[T]]
             }
@@ -132,6 +168,7 @@ object Transactor {
       */
     private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long]): Behavior[Session[T]] =
     {
+        println("Entering  sessionHandler currentValue " + currentValue + " commit " + commit + " done " + done)
         Behaviors.receive[Session[T]] {
             case (ctx, Extract(f, replyTo)) => {
                 println("Received Extract " + f(currentValue) + " " + replyTo)
@@ -139,13 +176,23 @@ object Transactor {
                 replyTo.narrow.tell(ret)
                 Behaviors.same[Session[T]]
             }
+            case (ctx, Stopped()) => {
+                println("Received Stopped ")
+                Behaviors.stopped
+            }
             case (ctx, Modify(f, id, reply, replyTo)) => {
                 println("Received Modify " + f + " " + id + " " + reply + " " + replyTo)
                 if (!done.contains(id)) {
                     val ret = f(currentValue)
-                    replyTo.narrow.tell(ret)
+                    println("Received Modify - apply function " + f + " returns " + ret)
+                    replyTo.narrow.tell(reply)
+//                    ctx.self ! Stopped()
+                    sessionHandler(ret, commit, (done + id))
+                } else {
+                    println("Received Modify - done already contains " + id + " and returns currentValue " + currentValue)
+                    replyTo.narrow.tell(reply)
+                    Behaviors.same[Session[T]]
                 }
-                Behaviors.same[Session[T]]
             }
             case (ctx, Commit(reply, replyTo)) => {
                 println("Received Commit " + reply + " " + replyTo)
@@ -154,6 +201,10 @@ object Transactor {
             }
             case (ctx, Rollback()) => {
                 println("Received Rollback")
+                Behaviors.same[Session[T]]
+            }
+            case (ctx, _) => {
+                println("Received unhandled type")
                 Behaviors.same[Session[T]]
             }
         }
