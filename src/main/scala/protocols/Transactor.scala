@@ -7,6 +7,7 @@ import akka.stream.impl.fusing.Batch
 import akka.util.Timeout
 import protocols.SelectiveReceiveOrig.Interceptor
 
+import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration._
 
 object Transactor {
@@ -17,6 +18,7 @@ object Transactor {
 
     sealed trait Command[T] extends PrivateCommand[T]
     final case class Begin[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
+    final case class Timeout[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends Command[T]
 
     sealed trait Session[T] extends Product with Serializable
     final case class Extract[T, U](f: T => U, replyTo: ActorRef[U]) extends Session[T]
@@ -25,18 +27,22 @@ object Transactor {
     final case class Rollback[T]() extends Session[T]
     final case class Stopped[T]() extends Session[T]
 
+    sealed trait State[T]
+    case class AwaitingSession[T]() extends State[T]
+    case class SessionEstablished[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends State[T]
+
     def committedBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Committed[T]] = {
-        Behaviors.receive[Committed[T]] {
+        Behaviors.receivePartial[Committed[T]] {
             case (ctx, Committed(session, value)) => {
                 println("commitedBuilder Committed!!!")
 //                session.narrow.tell(Commit(value, session))
                 Behaviors.same[Committed[T]]
             }
-            case (ctx, _) => {
-                println("commitedBuilder Others!!!")
-                idle[T](value, sessionTimeout)
-                Behaviors.same[Committed[T]]
-            }
+//            case (ctx, _) => {
+//                println("commitedBuilder Others!!!")
+//                idle[T](value, sessionTimeout)
+//                Behaviors.same[Committed[T]]
+//            }
         }
     }
 
@@ -44,13 +50,22 @@ object Transactor {
 
             Behaviors.receive[Command[T]] {
                 case (ctx, Begin(replyTo)) => {
-                    println("Begin!!!")
-                    val sh = sessionHandler(value, null, Set(), sessionTimeout)
+                    println(s"Begin!!!")
+                    val c = committedBuilder(value, sessionTimeout)
+                    val p = ctx.spawnAnonymous(c)
+                    ctx.watch(p)
+
+                    ctx.scheduleOnce(sessionTimeout, ctx.self, Timeout(replyTo))
+
+                    val sh = sessionHandler(value, p, Set(), sessionTimeout)
                     val actorRef = ctx.spawnAnonymous(sh)
                     replyTo ! actorRef
                     ctx.watch(actorRef)
-                    val p = ctx.spawnAnonymous(committedBuilder(value, sessionTimeout))
+
                     Behaviors.same[Command[T]]
+                }
+                case (ctx, Timeout(replyTo)) => {
+                    Behaviors.stopped[Command[T]]
                 }
                 case (ctx, _) => {
                     println("Others!!!")
@@ -169,8 +184,11 @@ object Transactor {
             }
             case (ctx, Commit(reply, replyTo)) => {
                 println("Received Commit " + reply + " " + replyTo)
-//                replyTo.narrow.tell(reply)
-                Behaviors.same
+                replyTo.narrow.tell(reply)
+                if (commit != null) {
+                    commit ! Committed(ctx.self, currentValue)
+                }
+                Behaviors.empty[Session[T]]
             }
             case (ctx, Rollback()) => {
                 println("Received Rollback")

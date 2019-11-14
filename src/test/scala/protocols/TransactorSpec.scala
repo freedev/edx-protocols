@@ -75,7 +75,9 @@ trait TransactorSpec extends FunSuite with MustMatchers with PropertyChecks {
     testkit.ref ! Begin(sessionInbox.ref)
     testkit.runOne()
     val ref :: Nil = sessionInbox.receiveAll()
-    val Effect.SpawnedAnonymous(_, _) :: Effect.Watched(`ref`) :: _ :: Nil = testkit.retrieveAllEffects()
+    val allEffects = testkit.retrieveAllEffects()
+    println(allEffects)
+    val Effect.SpawnedAnonymous(_, _) :: Effect.Watched(`ref`) :: _ :: Nil = allEffects
     ref must be(testkit.childInbox(ref.path.name).ref)
     val session = testkit.childTestKit(ref)
 
