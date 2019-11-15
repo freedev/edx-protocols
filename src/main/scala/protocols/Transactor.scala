@@ -31,46 +31,32 @@ object Transactor {
     case class AwaitingSession[T]() extends State[T]
     case class SessionEstablished[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends State[T]
 
-    def committedBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Committed[T]] = {
-        Behaviors.receivePartial[Committed[T]] {
-            case (ctx, Committed(session, value)) => {
-                println("commitedBuilder Committed!!!")
-//                session.narrow.tell(Commit(value, session))
-                Behaviors.same[Committed[T]]
-            }
-//            case (ctx, _) => {
-//                println("commitedBuilder Others!!!")
-//                idle[T](value, sessionTimeout)
-//                Behaviors.same[Committed[T]]
-//            }
-        }
-    }
-
-    def parentBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] = {
-
-            Behaviors.receive[Command[T]] {
+    def parentBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] = {
+        println("Entering  parentBuilder value " + value + " sessionTimeout" + sessionTimeout)
+            Behaviors.receive[PrivateCommand[T]] {
+                case (ctx, Committed(session, value)) => {
+                    println("commitedBuilder Committed!!!")
+                    //                session.narrow.tell(Commit(value, session))
+                    Behaviors.same[PrivateCommand[T]]
+                }
                 case (ctx, Begin(replyTo)) => {
-                    println(s"Begin!!!")
-                    val c = committedBuilder(value, sessionTimeout)
-                    val p = ctx.spawnAnonymous(c)
-                    ctx.watch(p)
-
-                    ctx.scheduleOnce(sessionTimeout, ctx.self, Timeout(replyTo))
-
-                    val sh = sessionHandler(value, p, Set(), sessionTimeout)
+                    println("Begin!!!")
+                    val sh = sessionHandler(value, ctx.self, Set(), sessionTimeout)
                     val actorRef = ctx.spawnAnonymous(sh)
-                    replyTo ! actorRef
                     ctx.watch(actorRef)
 
-                    Behaviors.same[Command[T]]
+                    replyTo ! actorRef
+                    ctx.scheduleOnce(sessionTimeout, ctx.self, Timeout(replyTo))
+
+                    Behaviors.same[PrivateCommand[T]]
                 }
                 case (ctx, Timeout(replyTo)) => {
-                    Behaviors.stopped[Command[T]]
+                    Behaviors.stopped[PrivateCommand[T]]
                 }
                 case (ctx, _) => {
                     println("Others!!!")
                     idle[T](value, sessionTimeout)
-                    Behaviors.same[Command[T]]
+                    Behaviors.same[PrivateCommand[T]]
                 }
             }
     }
@@ -85,7 +71,7 @@ object Transactor {
       * @param sessionTimeout Delay before rolling back the pending modifications and
       *                       terminating the session
       */
-    def apply[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] =
+    def apply[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] =
     {
         SelectiveReceive.apply(30, parentBuilder(value, sessionTimeout))
     }
