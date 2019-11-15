@@ -32,12 +32,18 @@ object Transactor {
     case class SessionEstablished[T](replyTo: ActorRef[ActorRef[Session[T]]]) extends State[T]
 
     def parentBuilder[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] = {
-        println("Entering  parentBuilder value " + value + " sessionTimeout" + sessionTimeout)
+        println("Entering  parentBuilder value:" + value + " sessionTimeout:" + sessionTimeout)
             Behaviors.receive[PrivateCommand[T]] {
-                case (ctx, Committed(session, value)) => {
+                case (ctx, Committed(session, newValue)) => {
                     println("commitedBuilder Committed!!!")
-                    //                session.narrow.tell(Commit(value, session))
-                    Behaviors.same[PrivateCommand[T]]
+//                    session ! Stopped[T]()
+                    parentBuilder(newValue, sessionTimeout)
+                }
+                case (ctx, RolledBack(session)) => {
+                    println(s"commitedBuilder RolledBack!!! $value")
+//                    session.narrow.tell(Stopped[T]())
+                    ctx.stop(session)
+                    Behaviors.empty[PrivateCommand[T]]
                 }
                 case (ctx, Begin(replyTo)) => {
                     println("Begin!!!")
@@ -46,7 +52,7 @@ object Transactor {
                     ctx.watch(actorRef)
 
                     replyTo ! actorRef
-                    ctx.scheduleOnce(sessionTimeout, ctx.self, Timeout(replyTo))
+                    ctx.scheduleOnce(sessionTimeout, ctx.self, RolledBack(actorRef))
 
                     Behaviors.same[PrivateCommand[T]]
                 }
@@ -109,30 +115,6 @@ object Transactor {
     }
 
     /**
-      * @return A behavior that defines how to react to [[PrivateCommand]] messages when the transactor has
-      *         a running session.
-      *         [[Committed]] and [[RolledBack]] messages should commit and rollback the session, respectively.
-      *         [[Begin]] messages should be unhandled (they will be handled by the [[SelectiveReceive]] decorator).
-      * @param rollbackValue Value to rollback to
-      * @param sessionTimeout Timeout to use for the next session
-      * @param sessionRef Reference to the child [[Session]] actor
-      */
-    private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
-    {
-        Behaviors.receive[PrivateCommand[T]] {
-            case (ctx, Begin(replyTo)) => {
-                Behaviors.same[PrivateCommand[T]]
-            }
-            case (ctx, Committed(session, value)) => {
-                Behaviors.same[PrivateCommand[T]]
-            }
-            case (ctx, RolledBack(session)) => {
-                Behaviors.same[PrivateCommand[T]]
-            }
-        }
-    }
-        
-    /**
       * @return A behavior handling [[Session]] messages. See in the instructions
       *         the precise semantics that each message should have.
       *
@@ -140,7 +122,7 @@ object Transactor {
       * @param commit Parent actor reference, to send the [[Committed]] message to
       * @param done Set of already applied [[Modify]] messages
       */
-    private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long], sessionTimeout: FiniteDuration): Behavior[Session[T]] =
+    private def sessionHandler[T](currentValue: T, commit: ActorRef[PrivateCommand[T]], done: Set[Long], sessionTimeout: FiniteDuration): Behavior[Session[T]] =
     {
         println("Entering  sessionHandler currentValue " + currentValue + " commit " + commit + " done " + done)
         Behaviors.receive[Session[T]] {
@@ -177,8 +159,11 @@ object Transactor {
                 Behaviors.empty[Session[T]]
             }
             case (ctx, Rollback()) => {
-                println("Received Rollback")
-                Behaviors.same[Session[T]]
+                println("Received Rollback!!!")
+                if (commit != null) {
+                    commit ! RolledBack(ctx.self)
+                }
+                Behaviors.empty[Session[T]]
             }
             case (ctx, _) => {
                 println("Received unhandled type")
