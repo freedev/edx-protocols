@@ -106,25 +106,10 @@ object Transactor {
     private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] = {
         println("Entering idle value:" + value + " sessionTimeout:" + sessionTimeout)
         Behaviors.receive[PrivateCommand[T]] {
-            case (ctx, Committed(session, newValue)) => {
-                println("idle Committed!!!")
-                //                    session ! Stopped[T]()
-                parentBuilder(newValue, sessionTimeout)
-            }
-            case (ctx, RolledBack(session)) => {
-                println(s"idle RolledBack!!! $value")
-                //                    session.narrow.tell(Stopped[T]())
-                ctx.stop(session)
-                Behaviors.empty[PrivateCommand[T]]
-            }
             case (ctx, Begin(replyTo)) => {
                 println("idle Begin!!!")
                 handleBegin(value, sessionTimeout, ctx, replyTo)
                 Behaviors.same[PrivateCommand[T]]
-            }
-            case (ctx, Timeout(replyTo)) => {
-                println("idle Timeout!!!")
-                Behaviors.stopped[PrivateCommand[T]]
             }
             case (ctx, _) => {
                 println("idle Others!!!")
@@ -180,9 +165,9 @@ object Transactor {
             }
             case (ctx, Rollback()) => {
                 println("Received Rollback!!!")
-                if (commit != null) {
-                    commit ! RolledBack(ctx.self)
-                }
+//                if (commit != null) {
+//                    commit ! RolledBack(ctx.self)
+//                }
                 Behaviors.empty[Session[T]]
             }
             case (ctx, _) => {
